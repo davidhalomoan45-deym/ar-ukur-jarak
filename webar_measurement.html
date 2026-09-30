@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <title>WebAR Measurement Prototype</title>
+    
+    <!-- Load Tailwind CSS for rapid UI styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Inter', sans-serif;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+
+        /* Customize the ARButton injected by Three.js */
+        #ARButton {
+            background-color: #2563eb !important; /* blue-600 */
+            border-radius: 12px !important;
+            border: 2px solid #fff !important;
+            padding: 12px 24px !important;
+            font-weight: 600 !important;
+            bottom: 24px !important;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1) !important;
+        }
+    </style>
+
+    <!-- We use import maps to load Three.js as ES modules -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+    <!-- UI Overlay (Fixed at the top, over the AR camera feed) -->
+    <div id="ui-container" class="absolute top-0 left-0 w-full p-4 z-10 flex flex-col items-center pointer-events-none transition-opacity duration-300">
+        <div class="bg-black/70 backdrop-blur-md text-white px-6 py-4 rounded-2xl shadow-xl text-center border border-white/20 w-full max-w-sm">
+            <h1 class="text-lg font-bold mb-1 tracking-wide">AR Ruler</h1>
+            <p id="status-text" class="text-sm text-gray-300 mb-2">Memuat pengalaman AR...</p>
+            
+            <div class="bg-black/50 rounded-xl p-3 my-3">
+                <span class="text-xs text-gray-400 uppercase tracking-wider block mb-1">Jarak Terukur</span>
+                <div id="distance-display" class="text-4xl font-extrabold text-green-400 font-mono">0.0 <span class="text-xl text-green-200">cm</span></div>
+            </div>
+
+            <!-- Reset Button: Needs pointer-events-auto to be clickable -->
+            <button id="reset-btn" class="pointer-events-auto mt-2 w-full py-3 bg-red-500 hover:bg-red-600 active:bg-red-700 rounded-xl font-semibold transition-colors duration-200 shadow-md">
+                Reset Pengukuran
+            </button>
+        </div>
+        
+        <!-- Info card for non-AR devices -->
+        <div id="info-card" class="mt-4 bg-yellow-500/90 text-black px-4 py-3 rounded-lg text-xs max-w-sm shadow-lg pointer-events-auto">
+            <strong>Catatan:</strong> Aplikasi ini membutuhkan smartphone dengan dukungan WebXR (ARCore/ARKit) dan browser Chrome/Edge terbaru.
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // Variables for Three.js
+        let container;
+        let camera, scene, renderer;
+        let controller;
+
+        // Variables for AR Hit Test
+        let reticle;
+        let hitTestSource = null;
+        let hitTestSourceRequested = false;
+
+        // Variables for Measurement Logic
+        let points = []; // Store the two clicked positions
+        let markers = []; // Store the 3D meshes for points
+        let line = null; // The 3D line connecting points
+
+        // UI Elements
+        const statusText = document.getElementById('status-text');
+        const distanceDisplay = document.getElementById('distance-display');
+        const resetBtn = document.getElementById('reset-btn');
+        const infoCard = document.getElementById('info-card');
+
+        init();
+        animate();
+
+        function init() {
+            container = document.createElement('div');
+            document.body.appendChild(container);
+
+            // 1. Setup Scene & Camera
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 2. Setup Lighting
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            light.position.set(0.5, 1, 0.25);
+            scene.add(light);
+
+            // 3. Setup Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true; // Enable WebXR
+            container.appendChild(renderer.domElement);
+
+            // 4. Setup AR Button
+            // Requesting 'hit-test' feature to detect real-world surfaces
+            document.body.appendChild(ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] }));
+
+            // 5. Setup Controller (Handling tap events)
+            controller = renderer.xr.getController(0);
+            controller.addEventListener('select', onSelect);
+            scene.add(controller);
+
+            // 6. Setup Reticle (The circular targeting ring)
+            // It uses a RingGeometry turned horizontally to sit on surfaces
+            const reticleGeometry = new THREE.RingGeometry(0.04, 0.05, 32).rotateX(-Math.PI / 2);
+            const reticleMaterial = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+            reticle = new THREE.Mesh(reticleGeometry, reticleMaterial);
+            reticle.matrixAutoUpdate = false;
+            reticle.visible = false;
+            scene.add(reticle);
+
+            // Handle XR Session Lifecycle Events to update UI
+            renderer.xr.addEventListener('sessionstart', () => {
+                infoCard.style.display = 'none'; // Hide info card in AR
+                resetMeasurement();
+                statusText.innerText = "Arahkan ke permukaan & tap layar.";
+            });
+            renderer.xr.addEventListener('sessionend', () => {
+                statusText.innerText = "Sesi AR berakhir.";
+                infoCard.style.display = 'block';
+            });
+
+            // 7. Setup Resize Event
+            window.addEventListener('resize', onWindowResize);
+
+            // Setup Reset Button Listener
+            resetBtn.addEventListener('click', resetMeasurement);
+        }
+
+        function onSelect() {
+            // Only place points if the reticle is tracking a surface
+            if (reticle.visible && points.length < 2) {
+                // Create a marker (a small sphere)
+                const geometry = new THREE.SphereGeometry(0.015, 16, 16);
+                const material = new THREE.MeshBasicMaterial({ color: 0x3b82f6 }); // Tailwind blue-500
+                const mesh = new THREE.Mesh(geometry, material);
+                
+                // Position the marker exactly at the reticle's matrix position
+                mesh.position.setFromMatrixPosition(reticle.matrix);
+                scene.add(mesh);
+                
+                // Store marker and position
+                markers.push(mesh);
+                points.push(mesh.position.clone());
+
+                if (points.length === 1) {
+                    statusText.innerText = "Titik pertama ditempatkan. Tap lagi.";
+                    reticle.material.color.setHex(0xffaa00); // Change reticle color to orange
+                } 
+                else if (points.length === 2) {
+                    // Two points placed -> Draw line and calculate distance
+                    drawLine(points[0], points[1]);
+                    calculateDistance(points[0], points[1]);
+                    
+                    statusText.innerText = "Pengukuran selesai.";
+                    reticle.visible = false; // Hide reticle temporarily
+                }
+            }
+        }
+
+        function drawLine(point1, point2) {
+            const lineGeometry = new THREE.BufferGeometry().setFromPoints([point1, point2]);
+            const lineMaterial = new THREE.LineBasicMaterial({ 
+                color: 0x3b82f6, // blue
+                linewidth: 3 // Note: WebGL line width is often limited to 1px by browsers
+            });
+            line = new THREE.Line(lineGeometry, lineMaterial);
+            scene.add(line);
+        }
+
+        function calculateDistance(point1, point2) {
+            // distanceTo returns distance in meters in WebXR coordinate system
+            const distanceInMeters = point1.distanceTo(point2);
+            // Convert to Centimeters
+            const distanceInCm = (distanceInMeters * 100).toFixed(1);
+            
+            // Update UI
+            document.getElementById('distance-display').innerHTML = `${distanceInCm} <span class="text-xl text-green-200">cm</span>`;
+        }
+
+        function resetMeasurement() {
+            // Remove markers from scene
+            markers.forEach(marker => {
+                scene.remove(marker);
+                marker.geometry.dispose();
+                marker.material.dispose();
+            });
+            markers = [];
+            points = [];
+
+            // Remove line from scene
+            if (line) {
+                scene.remove(line);
+                line.geometry.dispose();
+                line.material.dispose();
+                line = null;
+            }
+
+            // Reset UI and state
+            document.getElementById('distance-display').innerHTML = `0.0 <span class="text-xl text-green-200">cm</span>`;
+            statusText.innerText = "Arahkan ke permukaan & tap layar.";
+            reticle.material.color.setHex(0x00ff00); // Back to green
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render(timestamp, frame) {
+            if (frame) {
+                const referenceSpace = renderer.xr.getReferenceSpace();
+                const session = renderer.xr.getSession();
+
+                // Request Hit Test Source on first frame
+                if (hitTestSourceRequested === false) {
+                    session.requestReferenceSpace('viewer').then(function (referenceSpace) {
+                        session.requestHitTestSource({ space: referenceSpace }).then(function (source) {
+                            hitTestSource = source;
+                        });
+                    });
+                    
+                    // We need a local reference space to draw the reticle in the scene
+                    session.requestReferenceSpace('local').then(function (referenceSpace) {
+                        // Store it globally inside the frame object context for simplicity
+                        renderer.xr.referenceSpace = referenceSpace;
+                    });
+                    hitTestSourceRequested = true;
+                }
+
+                // Perform Hit Test on every frame
+                if (hitTestSource && renderer.xr.referenceSpace) {
+                    const hitTestResults = frame.getHitTestResults(hitTestSource);
+
+                    if (hitTestResults.length > 0) {
+                        const hit = hitTestResults[0];
+                        // Get the position/orientation of the hit test relative to the local environment
+                        const pose = hit.getPose(renderer.xr.referenceSpace);
+
+                        // Only show reticle if we haven't placed two points yet
+                        if (points.length < 2) {
+                            reticle.visible = true;
+                            // Apply the detected surface transform to our reticle ring
+                            reticle.matrix.fromArray(pose.transform.matrix);
+                        }
+                    } else {
+                        reticle.visible = false;
+                    }
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
